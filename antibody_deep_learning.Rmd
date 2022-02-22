@@ -1,0 +1,621 @@
+---
+title: "Predicting antibody binders and generating synthetic antibodies using deep learning"
+author: "Yoong Wearn Lim"
+date: "2022/02/18"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+    toc_depth: 5
+    code_folding: hide
+    theme: united
+---
+
+## Goals
+
+1. To predict binder and non-binder antibodies to CTLA-4 and PD-1, using Convolutional Neural Network (CNN).
+2. To generate synthetic antibody sequences (CDR3K + CDR3H) to CTLA-4 and PD-1, using Generative Adversarial Network (GAN).
+
+## Settings
+
+Ensure that python3 and tensorflow version 2.4.0 are used.
+
+```{r global_options, message = FALSE}
+knitr::opts_chunk$set(warning=FALSE, message=FALSE)
+
+library(reticulate)
+use_virtualenv("py3-virtualenv")
+py_config()
+library(keras)
+library(tidyverse)
+library(PepTools) 
+library(mltools)
+library(caret)
+library(pROC)
+
+filter = dplyr::filter
+select = dplyr::select
+theme_set(theme_bw())
+```
+
+## Predicting binders vs. non-binders (CNN)
+
+### Prepare sequences 
+
+Here we prepare CDR3K + CDR3H amino acid sequences for both targets:
+
+1. Load all pre- and post-FACS sorted sequences.
+2. Randomize the order of the sequences.
+3. Pad CDR3K and CDR3H with "-" so all sequences have the same length.
+4. Define binders and non-binders.
+  * Binders: post/pre fold change >= 1.8, post-sort frequency >= 0.01
+  * Non-binders: post/pre fold change < 1, pre-sort frequency >= 0.01
+5. Split sequences into training and testing sets.
+
+```{r}
+all <- read_delim("CNN/all_ab_pre_post.txt", delim = "\t")
+
+# shuffle order of data frame
+set.seed(42)
+rows <- sample(nrow(all))
+all <- all[rows, ]
+
+# padding
+max_k <- max(nchar(all$CDR3K)) # 11
+max_h <- max(nchar(all$CDR3H)) # 25
+
+all$paddedh <- gsub("\\s", "-", format(all$CDR3H, width = max_h))
+all$paddedk <- gsub("\\s", "-", format(all$CDR3K, width = max_k))
+all$lengthh <- nchar(all$CDR3H)
+all$lengthk <- nchar(all$CDR3K)
+all$padded <- paste0(all$paddedk, all$paddedh)
+
+# filter for only unique sequences
+all2 <- all %>% 
+  group_by(padded) %>% 
+  top_n(1, wt = post) 
+all2 <- all2[!duplicated(all2$padded), ] 
+
+# define binders/non-binders
+all2 <- all2 %>% 
+  ungroup() %>% 
+  mutate(enriched = ifelse((fc >= 1.8 & post >= 0.01), 1,
+                           ifelse(fc < 1 & pre >= 0.01, 0, "ambi")))
+
+all2 <- filter(all2, enriched != "ambi")
+
+# split test train
+split_train_test <- function(antigenx) {
+  mini <- all2 %>% filter(antigen == antigenx)
+  set.seed(22)
+  trainIndex <- createDataPartition(mini$enriched, p = .8, 
+                                  list = FALSE, 
+                                  times = 1)
+  df_train <- mini[ trainIndex, ]
+  df_test  <- mini[-trainIndex, ]
+
+  my_list <- list(train = df_train, test = df_test)
+  return(my_list)
+}
+c1 <- split_train_test("CTLA-4")
+p1 <- split_train_test("PD-1")
+
+saveRDS(c1, file = "CNN/c1.RDS")
+saveRDS(p1, file = "CNN/p1.RDS")
+```
+
+### Visualize test train split
+
+```{r, fig.width = 5, fig.height=3}
+c1$train$type <- "Train"
+c1$test$type <- "Test"
+c1_both <- bind_rows(c1$train, c1$test)
+
+p1$train$type <- "Train"
+p1$test$type <- "Test"
+p1_both <- bind_rows(p1$train, p1$test)
+
+both <- bind_rows(c1_both, p1_both)
+count <- data.frame(table(both$antigen, both$type, both$enriched))
+names(count) <- c("antigen", "type", "binder", "freq")
+count$type <- factor(count$type, levels = c("Train", "Test"))
+
+count$binder <- as.numeric(as.character(count$binder))
+count$binder[count$binder == 0] <- "Non-binder"
+count$binder[count$binder == 1] <- "Binder"
+
+ggplot(count, aes(x = type, y = freq, fill = binder, label = freq)) +
+  facet_wrap(~ antigen, scales = "free_y") +
+  geom_col(position = "stack") +
+  geom_text(position = position_stack(vjust = .5)) +
+  theme_bw() +
+  labs(y = "# sequences")
+
+```
+
+### Encoding
+
+Encode sequences into numerical matrices (images) using BLOSUM62 scores.
+
+```{r}
+# function to encode peptides
+load(file = "BLOSUM62_with_deletion.Rdata")
+
+pep_encode_blosum <- function(pep) {
+  bl62_prob <- BLOSUM62
+  p_mat <- pep %>% pep_mat
+  n_peps <- length(pep)
+  l_peps <- nchar(pep[1])
+  l_enc <- ncol(bl62_prob)
+  o_tensor <- array(data = NA, dim = c(n_peps, l_peps, l_enc))
+  for (i in 1:n_peps) {
+      pep_i_residues <- p_mat[i, ]
+      pep_img <- bl62_prob[pep_i_residues, ]
+      o_tensor[i, , ] <- pep_img
+  }
+  return(o_tensor)
+}
+```
+
+
+```{r}
+# CTLA-4
+c1_train <- pep_encode_blosum(c1$train$padded)
+c1_test  <- pep_encode_blosum(c1$test$padded)
+
+# reshape
+c1_train <- array_reshape(c1_train, c(nrow(c1_train), ncol(c1_train), 22, 1))
+c1_test  <- array_reshape(c1_test,  c(nrow(c1_test),  ncol(c1_test),  22, 1))
+
+num_classes <- 2
+
+c1_train_y <- c1$train %>% pull(enriched) %>% array %>% keras::to_categorical(num_classes = num_classes)
+c1_test_y  <- c1$test  %>% pull(enriched) %>% array %>% keras::to_categorical(num_classes = num_classes)
+
+# PD-1
+p1_train <- pep_encode_blosum(p1$train$padded)
+p1_test  <- pep_encode_blosum(p1$test$padded)
+
+# reshape
+p1_train <- array_reshape(p1_train, c(nrow(p1_train), ncol(p1_train), 22, 1))
+p1_test  <- array_reshape(p1_test,  c(nrow(p1_test),  ncol(p1_test),  22, 1))
+
+num_classes <- 2
+
+p1_train_y <- p1$train %>% pull(enriched) %>% array %>% keras::to_categorical(num_classes = num_classes)
+p1_test_y  <- p1$test  %>% pull(enriched) %>% array %>% keras::to_categorical(num_classes = num_classes)
+ 
+saveRDS(p1_train,   file = "CNN/p1_train.RDS")
+saveRDS(p1_test,    file = "CNN/p1_test.RDS")
+saveRDS(p1_train_y, file = "CNN/p1_train_y.RDS")
+saveRDS(p1_test_y,  file = "CNN/p1_test_y.RDS")
+saveRDS(c1_train,   file = "CNN/c1_train.RDS")
+saveRDS(c1_test,    file = "CNN/c1_test.RDS")
+saveRDS(c1_train_y, file = "CNN/c1_train_y.RDS")
+saveRDS(c1_test_y,  file = "CNN/c1_test_y.RDS")
+```
+
+### CNN models 
+
+Here we build CNN models to predict binders vs. non-binders. We train the CTLA-4 model and PD-1 model separately.
+
+```{r}
+model <- keras_model_sequential() %>% 
+  layer_conv_2d(filters = 64, kernel_size = c(3, 3), 
+                activation = "relu", input_shape = c(36, 22, 1), padding = "same") %>% 
+  layer_dropout(rate = 0.5) %>% 
+  layer_max_pooling_2d(pool_size = c(2, 2), padding = "same") %>% 
+  layer_conv_2d(filters = 32, kernel_size = c(3, 4), 
+                activation = "relu", padding = "same") %>% 
+  layer_dropout(rate = 0.4) %>% 
+  layer_max_pooling_2d(pool_size = c(2, 2), padding = "same") %>% 
+  layer_conv_2d(filters = 32, kernel_size = c(4, 4), 
+                activation = "relu", padding = "same") %>% 
+  layer_dropout(rate = 0.3) %>% 
+  layer_flatten() %>% 
+  layer_dense(units = 64, activation = "relu") %>% 
+  layer_dropout(rate = 0.4) %>% 
+  layer_dense(units = 2, activation = "softmax") 
+summary(model)
+
+# duplicate model
+# note we have to use "clone_model", can't just do model_c1 <- model (this is just a pointer)
+model_c1 <- clone_model(model)
+model_p1 <- clone_model(model)
+
+# need to compile each one separately
+model_c1 %>% compile(
+  loss      = 'categorical_crossentropy',
+  optimizer = 'adam',
+  metrics   = 'accuracy'
+)
+
+model_p1 %>% compile(
+  loss      = 'categorical_crossentropy',
+  optimizer = 'adam',
+  metrics   = 'accuracy'
+)
+
+epochs           <- 30
+batch_size       <- 50
+validation_split <- 0.2 
+
+# fit models
+c1_hist <- model_c1 %>% fit(
+  c1_train, c1_train_y, 
+  epochs           = epochs,
+  batch_size       = batch_size,
+  validation_split = validation_split)
+
+p1_hist <- model_p1 %>% fit(
+  p1_train, p1_train_y, 
+  epochs           = epochs,
+  batch_size       = batch_size,
+  validation_split = validation_split)
+
+model_c1 %>% save_model_tf("CNN/model_c1")
+model_p1 %>% save_model_tf("CNN/model_p1")
+```
+
+### Prediction
+
+Now that the models are fully trained, we evaluate them using the reserved 20% test sets.
+
+#### CTLA-4 model
+
+```{r, fig.width=2.5, fig.height=2.5}
+pred_c1 <- model_c1 %>% predict_proba(c1_test) %>% as.data.frame()
+names(pred_c1) <- c("nb_prob", "b_prob")
+y_real_c1 <- c1_test_y %>% apply(1,function(x){ return( which(x==1) - 1) })  
+y_pred_c1 <- model_c1 %>% keras::predict_classes(c1_test)
+
+perf_c1 <- model_c1 %>% evaluate(c1_test, c1_test_y) 
+acc_c1 <- perf_c1[[2]] %>% round(3) * 100
+mcc_c1 <- mltools::mcc(preds = as.vector(y_pred_c1), actuals = as.vector(y_real_c1)) %>% round(2)
+
+results_c1 <- tibble(y_real  = y_real_c1, 
+                     y_pred  = y_pred_c1, 
+                     b_prob  = pred_c1$b_prob)
+
+results_c1 <- results_c1 %>% 
+  mutate(class = ifelse(y_real == 0 & y_pred == 0, "TN", 
+                                     ifelse(y_real == 0 & y_pred == 1, "FP", 
+                                            ifelse(y_real == 1 & y_pred == 1, "TP",
+                                                   ifelse(y_real == 1 & y_pred == 0, "FN", NA)))))
+
+res_c1 <- table(results_c1[, 1:2]) %>% 
+  as.data.frame() %>% 
+  mutate(y_real = as.character(y_real),
+         y_pred = as.character(y_pred))
+
+res_c1$y_real[res_c1$y_real == 0] <- "Non-binder"
+res_c1$y_pred[res_c1$y_pred == 0] <- "Non-binder"
+res_c1$y_real[res_c1$y_real == 1] <- "Binder"
+res_c1$y_pred[res_c1$y_pred == 1] <- "Binder"
+res_c1$class <- c("TN", "FN", "FP", "TP")
+
+# generate confusion matrix
+ggplot(res_c1, aes(x = y_pred, y = y_real, label = Freq, color = class)) +
+  geom_text(size = 7) +
+  geom_tile(color = "black", fill = NA) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1, color = "black"),
+        axis.text.y = element_text(color = "black"),
+        axis.ticks = element_blank(), 
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank()) +
+  labs(y = "Measured (FACS)", x = "Predicted", title = "CTLA-4", 
+       subtitle = paste0("Accuracy=", acc_c1, "\nMCC=", mcc_c1)) +
+  scale_x_discrete(expand = c(0, 0)) +
+  scale_y_discrete(expand = c(0, 0)) +
+  guides(color = FALSE)
+
+# density plot showing binder probabilities
+ggplot(results_c1, aes(x = b_prob, color = class)) +
+  geom_density(fill = NA) +
+  theme(axis.text = element_text(color = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank()) +
+  labs(y = "Density", x = "Binder probability", title = "CTLA-4", color = "Type")
+
+# roc curve
+roc_obj_c1 <- roc(y_real_c1, results_c1$b_prob)
+plot.roc(roc_obj_c1, print.auc = TRUE, main = "CTLA-4 ROC curve")
+```
+
+#### PD-1 model
+
+```{r, fig.width=2.5, fig.height=2.5}
+pred_p1 <- model_p1 %>% predict_proba(p1_test) %>% as.data.frame()
+names(pred_p1) <- c("nb_prob", "b_prob")
+y_real_p1 <- p1_test_y %>% apply(1,function(x){ return( which(x==1) - 1) })  
+y_pred_p1 <- model_p1 %>% keras::predict_classes(p1_test)
+
+perf_p1 <- model_p1 %>% evaluate(p1_test, p1_test_y) 
+acc_p1 <- perf_p1[[2]] %>% round(3) * 100
+mcc_p1 <- mltools::mcc(preds = as.vector(y_pred_p1), actuals = as.vector(y_real_p1)) %>% round(2)
+
+results_p1 <- tibble(y_real  = y_real_p1, 
+                     y_pred  = y_pred_p1, 
+                     b_prob  = pred_p1$b_prob)
+
+results_p1 <- results_p1 %>% 
+  mutate(class = ifelse(y_real == 0 & y_pred == 0, "TN", 
+                                     ifelse(y_real == 0 & y_pred == 1, "FP", 
+                                            ifelse(y_real == 1 & y_pred == 1, "TP",
+                                                   ifelse(y_real == 1 & y_pred == 0, "FN", NA)))))
+
+res_p1 <- table(results_p1[, 1:2]) %>% 
+  as.data.frame() %>% 
+  mutate(y_real = as.character(y_real),
+         y_pred = as.character(y_pred))
+
+res_p1$y_real[res_p1$y_real == 0] <- "Non-binder"
+res_p1$y_pred[res_p1$y_pred == 0] <- "Non-binder"
+res_p1$y_real[res_p1$y_real == 1] <- "Binder"
+res_p1$y_pred[res_p1$y_pred == 1] <- "Binder"
+res_p1$class <- c("TN", "FN", "FP", "TP")
+
+# generate confusion matrix
+ggplot(res_p1, aes(x = y_pred, y = y_real, label = Freq, color = class)) +
+  geom_text(size = 7) +
+  geom_tile(color = "black", fill = NA) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1, color = "black"),
+        axis.text.y = element_text(color = "black"),
+        axis.ticks = element_blank(), 
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank()) +
+  labs(y = "Measured (FACS)", x = "Predicted", title = "PD-1", 
+       subtitle = paste0("Accuracy=", acc_p1, "\nMCC=", mcc_p1)) +
+  scale_x_discrete(expand = c(0, 0)) +
+  scale_y_discrete(expand = c(0, 0)) +
+  guides(color = FALSE)
+
+# density plot showing binder probabilities
+ggplot(results_p1, aes(x = b_prob, color = class)) +
+  geom_density(fill = NA) +
+  theme(axis.text = element_text(color = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank()) +
+  labs(y = "Density", x = "Binder probability", title = "PD-1", color = "Type")
+
+# roc curve
+roc_obj_p1 <- roc(y_real_p1, results_p1$b_prob)
+plot.roc(roc_obj_p1, print.auc = TRUE, main = "PD-1 ROC curve")
+```
+
+## Generating synthetic sequences (GAN)
+
+Here we build GAN models to generate anti-CTLA-4 and anti-PD-1 CDR3 sequences. We will train a separate model for each V gene, and we will train light and heavy chain separately. In total, we will train 15 models.
+
+### Prepare sequences
+
+Previously, we annotated full length light and heavy chain sequences using [ANARCI](http://opig.stats.ox.ac.uk/webapps/newsabdab/sabpred/anarci/). 
+
+We used the AHo numbering scheme, which is based on the structural alignments of the 3D structures of the antibody variable regions. A quote from https://plueckthun.bioc.uzh.ch/antibody/Numbering/NumFrame.html:
+
+> An important difference to the numbering scheme presented here (AHo) is that in the IMGT scheme insertions and deletions "grow" unidirectionally, as in the original Chothia definition (Chothia & Lesk, 1987), while in the AHo scheme, insertions and deletions are placed symmetrically around the key position marked in yellow. Furthermore, length variations in CDR 1 and CDR 2 are represented by a single gap in IMGT and by one or two gaps in AHo.
+
+After AHo annotation, the CDR3 regions were extracted from the sequences. All sequences now have the same sequence length. 
+
+### Encoding
+
+Here we encode the pre-processed CDR3 sequences into "images".
+
+```{r}
+# pre-processed CDR3 sequences, by target, chain, and V gene
+seq_all <- readRDS(file = "GAN/seq_all.RDS")
+
+encoded <- list()
+length(encoded) <- 15
+names(encoded) <- names(seq_all)
+
+for (i in 1:15) {
+  seq_encoded <- pep_encode_blosum(seq_all[[i]])
+  # reshape
+  encoded[[i]] <- array_reshape(seq_encoded, c(nrow(seq_encoded), ncol(seq_encoded), 22, 1))
+}
+saveRDS(encoded, file = "GAN/seq_all_encoded.RDS")
+
+head(str(encoded))
+# encoded is a list with 15 items
+str(encoded[[1]])
+# num [1:307, 1:32, 1:22, 1] 0.267 0.533 0.533 0.533 0.533 ...
+```
+
+### GAN models
+
+32 positions (row), 22 possible amino acids (including X and -) (columns).
+
+```{r}
+h <- 32; w <- 22; c <- 1; l <- 100
+loss_list <- list()
+
+# 1 model for each target/chain/V gene
+# 15 models total
+for (modelx in 1:15) {
+  # generator network
+  gi <- layer_input(shape = l)
+  
+  go <- gi %>% layer_dense(units = 16 * 11 * 128) %>% 
+    layer_activation_leaky_relu() %>% 
+    layer_reshape(target_shape = c(16, 11, 128)) %>% 
+    layer_conv_2d(filters = 64, 
+                  kernel_size = c(2, 2),
+                  padding = "same") %>% 
+    layer_activation_leaky_relu() %>% 
+    layer_conv_2d_transpose(filters = 32, 
+                            kernel_size = c(2, 2),
+                            strides = 2,
+                            padding = "same") %>% 
+    layer_activation_leaky_relu() %>% 
+    layer_conv_2d(filters = 128, 
+                  kernel_size = c(5, 6), 
+                  padding = "same") %>% 
+    layer_activation_leaky_relu() %>% 
+    layer_conv_2d(filters = 1,
+                  kernel_size = c(6, 6),
+                  activation = "tanh",
+                  padding = "same")
+  g <- keras_model(gi, go)
+  summary(g)
+
+  # discriminator network
+  di <- layer_input(shape = c(h, w, c))
+  
+  do <- di %>% 
+    layer_conv_2d(filters = 96, kernel_size = 3) %>% 
+    layer_activation_leaky_relu() %>% 
+    layer_flatten() %>% 
+    layer_dropout(rate = 0.3) %>% 
+    layer_dense(units = 1, activation = "sigmoid")
+  
+  d <- keras_model(di, do)
+  
+  summary(d)
+  
+  # compile discriminator
+  d %>% compile(optimizer = "rmsprop",
+                loss = "binary_crossentropy")
+  
+  # freeze weights and compile
+  freeze_weights(d)
+  
+  gani <- layer_input(shape = l)
+  gano <- gani %>% g %>% d 
+  gan <- keras_model(gani, gano)
+  gan %>%  compile(optimizer = "rmsprop",
+                   loss = "binary_crossentropy")
+  summary(gan)
+  
+  start <- 1; dloss <- NULL; gloss <- NULL
+  
+  # use batch size = 20, train 100 rounds
+  b <- 20
+  for (i in 1:100) {
+    # random noise
+    noise <- matrix(rnorm(b * l), nrow = b, ncol = l)
+    
+    fake <- g %>% predict(noise)
+    
+    # combine real and fake images
+    stop <- start + b - 1
+    # 50 random real images
+    rowx <- sample(nrow(encoded[[modelx]]), size = b)
+    real <- encoded[[modelx]][rowx,,, , drop = FALSE] # no need to reshape since we use drop=FALSE
+ 
+    rows <- nrow(real)
+    both <- array(0, dim = c(rows * 2, dim(real)[-1]))
+    both[1:rows,,,] <- fake
+    both[(rows + 1):(rows * 2),,,] <- real
+    labels <- rbind(matrix(runif(b, 0.9, 1), nrow = b, ncol = 1),
+                    matrix(runif(b, 0, 0.1), nrow = b, ncol = 1)) # note the noise in truth labels
+  
+    # train discriminator
+    dloss[i] <- d %>% train_on_batch(both, labels)
+    
+    # train generator using gan
+    fakeAsReal <- array(runif(b, 0, 0.1), dim = c(b, 1))
+    gloss[i] <- gan %>% train_on_batch(noise, fakeAsReal)
+  }  
+  
+  # save the generator
+  save_model_tf(g, filepath = paste0("GAN/GAN_model_", modelx))
+  
+  # monitor loss
+  res <- data.frame(iteration = seq(1:100), dloss = dloss, gloss = gloss)
+  res <- res %>% 
+    gather(type, value, 2:3)
+  res$id <- modelx
+  loss_list[[modelx]] <- res
+}
+```
+
+### Generating sequences
+
+Use the fully trained GAN models to generate 100 sequences for each model.
+
+```{r}
+myseq_all <- list()
+for (j in 1:15) {
+  # load previously saved generator
+  g <- load_model_tf(paste0("GAN/GAN_model_", j))
+  
+  myseq <- list()
+  for (i in 1:100) {
+    noise <- matrix(rnorm(b * l), nrow = b, ncol = l)
+
+    # generate fake image using the generator
+    fake <- g %>% predict(noise)
+    f <- fake[1,,,]
+    dim(f) <- c(32, 22, 1)
+  
+    myseq[[i]] <- f
+  }  
+  myseq_all[[j]] <- myseq
+}
+```
+
+### Decode images 
+
+Here we decode the generated CDR3 images back into amino acid sequences.
+
+```{r}
+aa_order <- c("A", "R", "N", "D", "C", "Q", "E", "G", "H", "I", "L", "K", "M", "F", "P", "S", "T", "W", "Y", "V", "X", "-")
+
+decode_seq_cdr3 <- function(seq_list) {
+  aa_list <- list()
+  for (i in 1:length(seq_list)) {
+    peptide1 <- as.data.frame(seq_list[[i]])
+    colnames(peptide1) <- aa_order
+    
+    # remove column for amino acid X
+    # it was previously added for padding so that we have an even shape
+    peptide1 <- peptide1 %>% select(-X)
+    
+    # which amino acid has the highest score (decoding)
+    aa <- colnames(peptide1)[apply(peptide1, 1, which.max)]
+    
+    # find where the gaps are
+    gaps <- which(aa %in% "-")
+    # first and last gap in CDR3 region
+    gap_first <- gaps[gaps > 1][1]
+    gap_last <- gaps[gaps < 32]
+    gap_last <- gap_last[length(gap_last)]
+    
+    # replace spurious aa flanked by gaps in CDR3
+    aa[gap_first:gap_last] <- "-"
+    
+    aa_string <- paste(aa, collapse = "")
+    
+    # remove gaps
+    aa_string <- gsub("-", "", aa_string) 
+    
+    aa_list[[i]] <- aa_string
+  }
+  all_aa <- data.frame(aa = do.call(rbind, aa_list))
+  return(all_aa)
+}
+```
+
+```{r, fig.width = 25, fig.height=2.5}
+gen_seq <- list()
+
+for (i in 1:15) {
+  temp <- decode_seq_cdr3(myseq_all[[i]])
+  gen_seq[[i]] <- temp$aa
+}  
+
+names(gen_seq) <- names(seq_all)
+```
+
+Example generated sequences:
+
+```{r}
+for (i in 1:15) {
+  print(names(gen_seq)[i])
+  print(gen_seq[[i]][!duplicated(gen_seq[[i]])] %>% head(10))
+}  
+```
+
+
