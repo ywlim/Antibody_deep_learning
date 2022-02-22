@@ -1,16 +1,7 @@
----
-title: "Predicting antibody binders and generating synthetic antibodies using deep learning"
-author: "Yoong Wearn Lim"
-date: "2022/02/18"
-output:
-  html_document:
-    toc: true
-    toc_float:
-      collapsed: false
-    toc_depth: 5
-    code_folding: hide
-    theme: united
----
+# Predicting antibody binders and generating synthetic antibodies using deep learning
+
+Author: Yoong Wearn Lim
+Date: 2022/02/18
 
 ## Goals
 
