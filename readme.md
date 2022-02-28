@@ -482,11 +482,11 @@ After AHo annotation, the CDR3 regions were extracted from the sequences. All se
 
 ### Encoding
 
-Here we encode the pre-processed CDR3 sequences into "images".
+Here we encode the previously prepared CDR3 sequences into "images".
 
 
 ```r
-# pre-processed CDR3 sequences, by target, chain, and V gene
+# previously prepared CDR3 sequences, by target, chain, and V gene
 seq_all <- readRDS(file = "GAN/seq_all.RDS")
 
 encoded <- list()
